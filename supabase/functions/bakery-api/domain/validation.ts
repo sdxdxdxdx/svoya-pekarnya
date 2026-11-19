@@ -49,6 +49,11 @@ function optionalArchived(data: Record<string, unknown>): { archived?: boolean }
   if (typeof data.archived !== 'boolean') throw new ValidationError('Признак архива должен быть логическим значением.');
   return { archived: data.archived };
 }
+function optionalSalesReturn(data: Record<string, unknown>): { salesReturn?: boolean } {
+  if (data.salesReturn === undefined) return {};
+  if (typeof data.salesReturn !== 'boolean') throw new ValidationError('Признак возврата должен быть логическим значением.');
+  return { salesReturn: data.salesReturn };
+}
 
 export function validateData<K extends RecordKind>(kind: K, data: unknown, records: BakeryRecord[], excludeId?: string): DataByKind[K] {
   const d = object(data);
@@ -71,9 +76,15 @@ export function validateData<K extends RecordKind>(kind: K, data: unknown, recor
       result = { name: text(d.name, 'Имя сотрудницы'), shiftRateKopecks: amount(d.shiftRateKopecks, 'Ставка за смену'), ...optionalArchived(d) };
       break;
     case 'purchase': {
+      if (d.amountOnly !== undefined && typeof d.amountOnly !== 'boolean') throw new ValidationError('Признак закупки без количества должен быть логическим значением.');
+      if (d.amountOnly === true) {
+        if (['quantity', 'unit', 'unitPriceKopecks', 'packQuantity', 'packUnit'].some(key => key in d)) throw new ValidationError('В закупке только с суммой нельзя указывать количество, единицу или цену единицы.');
+        result = { date: date(d.date, 'Дата закупки'), ingredientId: reference(d.ingredientId, 'ingredient', 'Сырьё'), amountOnly: true, totalKopecks: amount(d.totalKopecks, 'Сумма закупки', true), ...optionalNote(d) };
+        break;
+      }
       const unit = choice(d.unit, purchaseUnits, 'Единица закупки');
-      const purchase = { date: date(d.date, 'Дата закупки'), ingredientId: reference(d.ingredientId, 'ingredient', 'Сырьё'), quantity: quantity(d.quantity, 'Количество закупки'), unit, unitPriceKopecks: amount(d.unitPriceKopecks, 'Цена единицы'), ...optionalNote(d) };
-      total(purchase.quantity * purchase.unitPriceKopecks);
+      const purchase = { date: date(d.date, 'Дата закупки'), ingredientId: reference(d.ingredientId, 'ingredient', 'Сырьё'), quantity: quantity(d.quantity, 'Количество закупки'), unit, unitPriceKopecks: amount(d.unitPriceKopecks, 'Цена единицы'), ...(d.totalKopecks === undefined ? {} : { totalKopecks: amount(d.totalKopecks, 'Сумма закупки', true) }), ...optionalNote(d) };
+      total(purchase.totalKopecks ?? purchase.quantity * purchase.unitPriceKopecks);
       result = unit === 'pack' ? { ...purchase, packQuantity: quantity(d.packQuantity, 'Содержимое упаковки'), packUnit: choice(d.packUnit, ['kg', 'g', 'l', 'ml', 'pcs'] as const, 'Единица содержимого') } : purchase;
       break;
     }
@@ -82,8 +93,21 @@ export function validateData<K extends RecordKind>(kind: K, data: unknown, recor
         const line = object(value);
         return { productId: reference(line.productId, 'product', 'Изделие'), quantity: quantity(line.quantity, 'Количество изделий'), unitPriceKopecks: amount(line.unitPriceKopecks, 'Цена продажи') };
       });
-      total(saleLines.reduce((sum, line) => sum + Math.round(line.quantity * line.unitPriceKopecks), 0));
-      result = { date: date(d.date, 'Дата продажи'), shop: text(d.shop, 'Магазин'), lines: saleLines, ...optionalNote(d) };
+      const invoiceTotal = saleLines.reduce((sum, line) => { const value = line.quantity * line.unitPriceKopecks; return sum + Math.round(value + Number.EPSILON * Math.abs(value)); }, 0);
+      total(invoiceTotal);
+      const saleDate = date(d.date, 'Дата продажи');
+      let payments;
+      if (d.payments !== undefined) {
+        if (!Array.isArray(d.payments) || d.payments.length > 100) throw new ValidationError('Укажите от 0 до 100 оплат по накладной.');
+        payments = d.payments.map(value => {
+          const payment = object(value);
+          const paymentDate = date(payment.date, 'Дата оплаты накладной');
+          if (paymentDate < saleDate) throw new ValidationError('Дата оплаты не может быть раньше даты накладной.');
+          return { date: paymentDate, amountKopecks: amount(payment.amountKopecks, 'Оплата накладной', true) };
+        });
+        if (payments.reduce((sum, payment) => sum + payment.amountKopecks, 0) > invoiceTotal) throw new ValidationError('Оплаты не могут превышать сумму накладной.');
+      }
+      result = { date: saleDate, shop: text(d.shop, 'Магазин'), lines: saleLines, ...(payments === undefined ? {} : { payments }), ...optionalNote(d) };
       break;
     }
     case 'recipe': {
@@ -110,7 +134,7 @@ export function validateData<K extends RecordKind>(kind: K, data: unknown, recor
       result = { date: date(d.date, 'Дата выплаты'), employeeId: reference(d.employeeId, 'employee', 'Сотрудница'), amountKopecks: amount(d.amountKopecks, 'Сумма выплаты', true), ...optionalNote(d) };
       break;
     case 'expense':
-      result = { date: date(d.date, 'Дата оплаты'), ...(d.recognitionDate === undefined ? {} : { recognitionDate: date(d.recognitionDate, 'Дата признания расхода') }), category: text(d.category, 'Категория', 120), amountKopecks: amount(d.amountKopecks, 'Сумма расхода', true), ...optionalNote(d) };
+      result = { date: date(d.date, 'Дата оплаты'), ...(d.recognitionDate === undefined ? {} : { recognitionDate: date(d.recognitionDate, 'Дата признания расхода') }), category: text(d.category, 'Категория', 120), amountKopecks: amount(d.amountKopecks, 'Сумма расхода', true), ...optionalSalesReturn(d), ...optionalNote(d) };
       break;
     case 'cashMovement':
       result = { date: date(d.date, 'Дата движения'), direction: choice(d.direction, ['in', 'out'] as const, 'Направление движения'), owner: text(d.owner, 'Владелец', 160, true), amountKopecks: amount(d.amountKopecks, 'Сумма движения', true), ...optionalNote(d) };

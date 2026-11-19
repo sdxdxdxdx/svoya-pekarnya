@@ -84,3 +84,41 @@ test('validates payment, expense recognition, owner direction and optional notes
 test('accepts calendar-valid early years without JavaScript’s 1900-year remapping', () => {
   assert.equal(validateData('expense', { date: '0001-01-01', category: 'Прочее', amountKopecks: 100 }, []).date, '0001-01-01');
 });
+
+test('roundtrips explicit unpaid and dated partial settlements while preserving legacy absence', () => {
+  const sale = { date: day, shop: 'Тестовая торговая точка', lines: [{ productId: id('product'), quantity: 2, unitPriceKopecks: 12000 }] };
+  assert.deepEqual(validateData('sale', sale, catalogs()), sale);
+  assert.deepEqual(validateData('sale', { ...sale, payments: [] }, catalogs()), { ...sale, payments: [] });
+  const payments = [{ date: day, amountKopecks: 1000 }, { date: '2026-11-20', amountKopecks: 23000 }];
+  assert.deepEqual(validateData('sale', { ...sale, payments }, catalogs()), { ...sale, payments });
+  assert.equal(validateData('sale', { ...sale, payments: Array(100).fill({ date: day, amountKopecks: 1 }) }, catalogs()).payments?.length, 100);
+});
+
+test('rejects malformed, excessive, overpaid or pre-invoice settlements', () => {
+  const sale = { date: day, shop: 'Тестовая торговая точка', lines: [{ productId: id('product'), quantity: 2, unitPriceKopecks: 12000 }] };
+  for (const payments of [null, {}, 'paid', Array(101).fill({ date: day, amountKopecks: 1 }), [{ date: '2026-02-30', amountKopecks: 1 }], [{ date: '2026-11-18', amountKopecks: 1 }]]) rejects('sale', { ...sale, payments });
+  for (const amountKopecks of [0, -1, 0.5, '100', NaN, Infinity, 1e16, 24001]) rejects('sale', { ...sale, payments: [{ date: day, amountKopecks }] });
+  rejects('sale', { ...sale, payments: [{ date: day, amountKopecks: 12001 }, { date: day, amountKopecks: 12000 }] });
+});
+
+test('amount only purchases retain a total without silently inventing or accepting quantities', () => {
+  const purchase = { date: day, ingredientId: id('ingredient'), amountOnly: true, totalKopecks: 78000, note: ' Нужна накладная ' };
+  assert.deepEqual(validateData('purchase', purchase, catalogs()), { ...purchase, note: 'Нужна накладная' });
+  for (const totalKopecks of [undefined, 0, -1, 0.5, NaN, Infinity, '78000', 1e16]) rejects('purchase', { ...purchase, totalKopecks });
+  for (const extra of [{ quantity: 2 }, { unit: 'kg' }, { unitPriceKopecks: 100 }, { packQuantity: 5 }, { packUnit: 'kg' }]) rejects('purchase', { ...purchase, ...extra });
+  rejects('purchase', { ...purchase, amountOnly: 'true' });
+  rejects('purchase', { ...purchase, amountOnly: false });
+});
+
+test('sales return marker is explicit boolean and survives server validation', () => {
+  const expense = { date: day, category: 'Возврат', amountKopecks: 1200 };
+  assert.deepEqual(validateData('expense', { ...expense, salesReturn: true }, []), { ...expense, salesReturn: true });
+  assert.deepEqual(validateData('expense', { ...expense, salesReturn: false }, []), { ...expense, salesReturn: false });
+  rejects('expense', { ...expense, salesReturn: 'true' });
+});
+
+test('quantified purchases preserve authoritative invoice totals with bounded whole kopecks', () => {
+  const purchase = { date: day, ingredientId: id('ingredient'), quantity: 3, unit: 'kg', unitPriceKopecks: 334, totalKopecks: 1001 };
+  assert.deepEqual(validateData('purchase', purchase, catalogs()), purchase);
+  for (const totalKopecks of [0, -1, 0.5, NaN, Infinity, '1001', 1e16]) rejects('purchase', { ...purchase, totalKopecks });
+});

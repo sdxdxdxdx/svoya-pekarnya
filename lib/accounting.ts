@@ -1,4 +1,4 @@
-import type { BakeryRecord, IngredientCost, MissingCost, ProductReport, Quote, RecipeCost, RecipeUnit, Report } from './types.ts';
+import type { BakeryRecord, IngredientCost, MissingCost, ProductReport, PurchaseData, Quote, RecipeCost, RecipeUnit, Report, SaleData, SalePayment } from './types.ts';
 
 const rubles = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const unitNames: Record<string, string> = { kg: 'кг', g: 'г', l: 'л', ml: 'мл', pcs: 'шт.', pack: 'уп.' };
@@ -22,6 +22,24 @@ export function dateLabel(date: string): string {
   return /^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date.slice(8)}.${date.slice(5, 7)}.${date.slice(0, 4)}` : date;
 }
 
+export function purchaseTotal(purchase: PurchaseData): number {
+  if (purchase.amountOnly === true) return purchase.totalKopecks;
+  return purchase.totalKopecks ?? roundKopecks(purchase.quantity * purchase.unitPriceKopecks);
+}
+
+export function saleTotal(sale: SaleData): number {
+  return sale.lines.reduce((sum, line) => sum + roundKopecks(line.quantity * line.unitPriceKopecks), 0);
+}
+
+export function salePayments(sale: SaleData): SalePayment[] {
+  return sale.payments ?? [{ date: sale.date, amountKopecks: saleTotal(sale) }];
+}
+
+export function saleDebtKopecks(sale: SaleData, asOf: string): number {
+  if (sale.date > asOf) return 0;
+  return Math.max(0, saleTotal(sale) - salePayments(sale).filter(payment => payment.date <= asOf).reduce((sum, payment) => sum + payment.amountKopecks, 0));
+}
+
 function newest(a: BakeryRecord, b: BakeryRecord): number {
   return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
 }
@@ -43,9 +61,18 @@ export function quoteFor(ingredientId: string, date: string, records: BakeryReco
   purchases.sort((a, b) => a.data.date.localeCompare(b.data.date) || newest(a, b));
   const purchase = purchases.at(-1);
   const sourceDate = purchase?.data.date ?? (ingredient.data.initialPriceDate <= date ? ingredient.data.initialPriceDate : null);
-  const price = purchase?.data.unitPriceKopecks ?? (sourceDate ? ingredient.data.initialPriceKopecks : null);
-  const unit = purchase?.data.unit ?? ingredient.data.initialUnit;
   const missing = (issue: string): Quote => ({ perBaseKopecks: null, baseUnit: null, label: 'Цена не определена', sourceDate, issue: `${name}: ${issue}` });
+  let price: number | null;
+  let unit;
+  if (purchase) {
+    const data = purchase.data;
+    if (data.amountOnly === true) return missing('для последней закупки указана только сумма; уточните количество и единицу закупки.');
+    price = data.totalKopecks === undefined ? data.unitPriceKopecks : data.totalKopecks / data.quantity;
+    unit = data.unit;
+  } else {
+    price = sourceDate ? ingredient.data.initialPriceKopecks : null;
+    unit = ingredient.data.initialUnit;
+  }
   if (price === null || !Number.isFinite(price) || price < 0) return missing('нет цены на выбранную дату.');
   if (!unit) return missing('уточните единицу начальной цены.');
   if (unit === 'pack') {
@@ -100,20 +127,23 @@ export function costForProduct(productId: string, date: string, records: BakeryR
 export function calculateReport(records: BakeryRecord[], from: string, to: string): Report {
   const active = records.filter(r => !r.deletedAt);
   const within = (date: string) => date >= from && date <= to;
-  const report: Report = { from, to, revenueKopecks: 0, materialCostKopecks: 0, knownMaterialCostKopecks: 0, wagesAccruedKopecks: 0, wagesPaidKopecks: 0, purchasesPaidKopecks: 0, otherExpenseKopecks: 0, expensesPaidKopecks: 0, ownerInKopecks: 0, ownerOutKopecks: 0, cashInflowKopecks: 0, cashOutflowKopecks: 0, cashDeltaKopecks: 0, profitKopecks: 0, owedWagesKopecks: 0, missing: [], products: [] };
+  const report: Report = { from, to, grossRevenueKopecks: 0, salesReturnsKopecks: 0, revenueKopecks: 0, saleReceiptsKopecks: 0, salesReturnsPaidKopecks: 0, receivablesKopecks: 0, materialCostKopecks: 0, knownMaterialCostKopecks: 0, wagesAccruedKopecks: 0, wagesPaidKopecks: 0, purchasesPaidKopecks: 0, otherExpenseKopecks: 0, expensesPaidKopecks: 0, ownerInKopecks: 0, ownerOutKopecks: 0, cashInflowKopecks: 0, cashOutflowKopecks: 0, cashDeltaKopecks: 0, profitKopecks: 0, owedWagesKopecks: 0, missing: [], products: [] };
   const products = new Map<string, ProductReport & { exactCost: number }>();
   const missing = new Map<string, MissingCost>();
   const employeeAccruals = new Map<string, number>();
   const employeePayments = new Map<string, number>();
   let exactKnown = 0;
   for (const record of active) {
-    if (record.kind === 'sale' && within(record.data.date)) {
+    if (record.kind === 'sale') {
+      report.saleReceiptsKopecks += salePayments(record.data).filter(payment => within(payment.date)).reduce((sum, payment) => sum + payment.amountKopecks, 0);
+      report.receivablesKopecks += saleDebtKopecks(record.data, to);
+      if (!within(record.data.date)) continue;
       for (const line of record.data.lines) {
         const catalog = active.find(r => r.kind === 'product' && r.id === line.productId);
         const name = catalog?.kind === 'product' ? catalog.data.name : 'Удалённое изделие';
         const product = products.get(line.productId) ?? { productId: line.productId, name, quantity: 0, revenueKopecks: 0, materialCostKopecks: 0, exactCost: 0 };
         const revenue = roundKopecks(line.quantity * line.unitPriceKopecks);
-        report.revenueKopecks += revenue;
+        report.grossRevenueKopecks += revenue;
         product.revenueKopecks += revenue;
         product.quantity += line.quantity;
         const detail = recipeDetails(line.productId, record.data.date, active);
@@ -135,20 +165,26 @@ export function calculateReport(records: BakeryRecord[], from: string, to: strin
     } else if (record.kind === 'wagePayment') {
       if (within(record.data.date)) report.wagesPaidKopecks += record.data.amountKopecks;
       if (record.data.date <= to) employeePayments.set(record.data.employeeId, (employeePayments.get(record.data.employeeId) ?? 0) + record.data.amountKopecks);
-    } else if (record.kind === 'purchase' && within(record.data.date)) report.purchasesPaidKopecks += roundKopecks(record.data.quantity * record.data.unitPriceKopecks);
+    } else if (record.kind === 'purchase' && within(record.data.date)) report.purchasesPaidKopecks += purchaseTotal(record.data);
     else if (record.kind === 'expense') {
-      if (within(record.data.recognitionDate ?? record.data.date)) report.otherExpenseKopecks += record.data.amountKopecks;
-      if (within(record.data.date)) report.expensesPaidKopecks += record.data.amountKopecks;
+      if (record.data.salesReturn) {
+        if (within(record.data.recognitionDate ?? record.data.date)) report.salesReturnsKopecks += record.data.amountKopecks;
+        if (within(record.data.date)) report.salesReturnsPaidKopecks += record.data.amountKopecks;
+      } else {
+        if (within(record.data.recognitionDate ?? record.data.date)) report.otherExpenseKopecks += record.data.amountKopecks;
+        if (within(record.data.date)) report.expensesPaidKopecks += record.data.amountKopecks;
+      }
     } else if (record.kind === 'cashMovement' && within(record.data.date)) {
       if (record.data.direction === 'in') report.ownerInKopecks += record.data.amountKopecks;
       else report.ownerOutKopecks += record.data.amountKopecks;
     }
   }
   report.knownMaterialCostKopecks = roundKopecks(exactKnown);
+  report.revenueKopecks = report.grossRevenueKopecks - report.salesReturnsKopecks;
   if (report.materialCostKopecks !== null) report.materialCostKopecks = report.knownMaterialCostKopecks;
   report.profitKopecks = report.materialCostKopecks === null ? null : report.revenueKopecks - report.materialCostKopecks - report.wagesAccruedKopecks - report.otherExpenseKopecks;
-  report.cashInflowKopecks = report.revenueKopecks + report.ownerInKopecks;
-  report.cashOutflowKopecks = report.purchasesPaidKopecks + report.wagesPaidKopecks + report.expensesPaidKopecks + report.ownerOutKopecks;
+  report.cashInflowKopecks = report.saleReceiptsKopecks + report.ownerInKopecks;
+  report.cashOutflowKopecks = report.purchasesPaidKopecks + report.wagesPaidKopecks + report.expensesPaidKopecks + report.salesReturnsPaidKopecks + report.ownerOutKopecks;
   report.cashDeltaKopecks = report.cashInflowKopecks - report.cashOutflowKopecks;
   for (const [employeeId, accrued] of employeeAccruals) report.owedWagesKopecks += Math.max(0, accrued - (employeePayments.get(employeeId) ?? 0));
   report.products = [...products.values()].map(({ exactCost, ...product }) => ({ ...product, materialCostKopecks: product.materialCostKopecks === null ? null : roundKopecks(exactCost) }));
